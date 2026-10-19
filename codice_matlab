@@ -1,0 +1,356 @@
+%% 1. CARICAMENTO DEL CASO E CALCOLO LOAD FLOW
+mpc = case39();
+mpopt = mpoption('verbose', 0, 'out.all', 0);
+[results, success] = runpf(mpc, mpopt);
+
+if ~success
+    error('Il load flow AC non è convergente. Figura non generata.');
+end
+
+%% 2. ESTRAZIONE DEI RISULTATI
+% Matrice bus dopo runpf:
+%   col. 1 = numero bus, col. 2 = tipo bus, col. 8 = Vm,
+%   col. 12 = VMAX, col. 13 = VMIN.
+bus_num = results.bus(:, 1);
+V_mag   = results.bus(:, 8);
+Vmax    = results.bus(:, 12);
+Vmin    = results.bus(:, 13);
+bus_type = results.bus(:, 2);
+
+% Matrice branch dopo runpf:
+%   col. 1 = from, col. 2 = to, col. 6 = RATE_A,
+%   col. 11 = status, col. 14:17 = PF, QF, PT, QT.
+from_bus = results.branch(:, 1);
+to_bus   = results.branch(:, 2);
+rate_A   = results.branch(:, 6);
+branch_status = results.branch(:, 11) ~= 0;
+
+% Flussi apparenti alle due estremità (MVA).
+PF = results.branch(:, 14);
+QF = results.branch(:, 15);
+PT = results.branch(:, 16);
+QT = results.branch(:, 17);
+SF = hypot(PF, QF);
+ST = hypot(PT, QT);
+Smax_MVA = max([SF, ST], [], 2);
+
+% Calcolo del caricamento solo quando esiste un RATE_A positivo.
+% RATE_A = 0 significa che il limite non è specificato nel modello:
+% non viene sostituito con un valore arbitrario.
+valid_rate = (rate_A > 0) & branch_status;
+loading_pct = nan(size(rate_A));
+loading_pct(valid_rate) = 100 .* Smax_MVA(valid_rate) ./ rate_A(valid_rate);
+
+%% 3. COORDINATE GEOGRAFICHE DEI BUS
+% La posizione geografica del caso IEEE 39-bus va considerata indicativa
+% se non è stata verificata rispetto a una fonte documentale affidabile.
+coords = [
+%   Bus   Latitudine  Longitudine
+     1,    42.46,      -72.62;      % Snodo ovest sotto Brattleboro
+     2,    42.68,      -72.56;      % Brattleboro
+     3,    42.16,      -72.60;      % Holyoke / Chicopee
+     4,    41.78,      -72.68;      % Hartford
+     5,    41.56,      -72.82;      % Waterbury / New Britain ovest
+     6,    41.48,      -72.65;      % Snodo centrale CT
+     7,    41.40,      -72.88;      % Snodo sopra New Haven
+     8,    41.45,      -73.20;      % Danbury est
+     9,    41.68,      -73.45;      % Confine NY/CT ovest
+    10,    41.42,      -72.22;      % New London / G3
+    11,    41.52,      -72.42;      % Snodo CT centro-est
+    12,    41.54,      -72.25;      % Snodo intermedio
+    13,    41.66,      -72.35;      % Est di Hartford
+    14,    41.75,      -72.38;      % Est di Hartford
+    15,    42.12,      -71.58;      % Sud di Framingham
+    16,    42.26,      -71.42;      % Framingham / hub centrale
+    17,    42.25,      -71.78;      % Worcester
+    18,    42.15,      -72.12;      % Tra Holyoke e Worcester
+    19,    41.92,      -71.42;      % Providence
+    20,    41.78,      -71.22;      % Fall River
+    21,    42.18,      -71.12;      % Sud di Quincy
+    22,    41.8975,    -70.8719;    % Plymouth entroterra
+    23,    41.84,      -70.62;      % Verso Barnstable
+    24,    42.26,      -71.08;      % Boston / Quincy
+    25,    42.72,      -71.50;      % Nashua
+    26,    42.7979,    -71.5461;    % Est di Nashua
+    27,    42.48,      -71.52;      % Sud di Nashua
+    28,    43.1143,    -70.8009;    % Portsmouth / Dover
+    29,    43.55,      -70.35;      % Biddeford / Portland
+    30,    42.8534,    -72.788;     % Coordinate Generatore 10
+    31,    41.3864,    -72.6461;    % Coordinate Generatore 2
+    32,    41.32,      -72.15;      % Coordinate Generatore 3
+    33,    41.78,      -71.36;      % Coordinate Generatore 4
+    34,    41.72,      -71.19;      % Coordinate Generatore 5
+    35,    41.94,      -70.58;      % Coordinate Generatore 6
+    36,    41.77,      -70.51;      % Coordinate Generatore 7
+    37,    43.959506,  -69.702481;  % Coordinate Generatore 8
+    38,    42.987655,  -72.513768; % Coordinate Generatore 9
+    39,    42.45,      -73.78       % Coordinate Generatore 10
+];
+
+
+% Riordina le coordinate secondo l'ordine effettivo in results.bus.
+lat = coords(idxCoord, 2);
+lon = coords(idxCoord, 3);
+
+%% 4. CLASSIFICAZIONE DEI BUS E CONTROLLO DEI LIMITI DI TENSIONE
+is_gen   = ismember(bus_num, results.gen(:, 1));
+is_slack = (bus_type == 3);  % Tipo 3 = bus di riferimento (slack)
+
+tol = 1e-6;
+violV = (V_mag < Vmin - tol) | (V_mag > Vmax + tol);
+
+% Etichette: bus di carico come "Bus N", generatori come "N" e slack esplicito.
+etichette = cell(numel(bus_num), 1);
+for k = 1:numel(bus_num)
+    b = bus_num(k);
+    if is_slack(k)
+        etichette{k} = sprintf('%d (Slack)', b);
+    elseif is_gen(k)
+        etichette{k} = sprintf('%d', b);
+    else
+        etichette{k} = sprintf('Bus %d', b);
+    end
+end
+
+%% 5. CREAZIONE DELLA FIGURA E DELLA MAPPA
+fig = figure('Name', 'IEEE 39-Bus - Load Flow AC', ...
+             'Position', [60, 40, 1450, 1000], ...
+             'Color', 'w');
+ax = geoaxes(fig);
+geobasemap(ax, 'streets-light');
+hold(ax, 'on');
+
+% Colori dei rami classificati rispetto al RATE_A.
+col_low   = [0.10, 0.40, 0.80];  % < 40%
+col_mid   = [0.88, 0.70, 0.10];  % 40-<75%
+col_high  = [0.95, 0.48, 0.08];  % 75-100%
+col_over  = [0.80, 0.08, 0.08];  % > 100%
+col_norate = [0.42, 0.42, 0.42]; % RATE_A non specificato
+
+% Un solo handle per classe, per costruire la legenda senza duplicati.
+hLoadLow = gobjects(0);
+hLoadMid = gobjects(0);
+hLoadHigh = gobjects(0);
+hLoadOver = gobjects(0);
+hNoRate = gobjects(0);
+
+%% 6. DISEGNO DEI RAMI
+for i = 1:size(results.branch, 1)
+    if ~branch_status(i)
+        % I rami fuori servizio non vengono disegnati come collegamenti attivi.
+        continue;
+    end
+
+    f = from_bus(i);
+    t = to_bus(i);
+    idx_f = find(bus_num == f, 1);
+    idx_t = find(bus_num == t, 1);
+
+    if isempty(idx_f) || isempty(idx_t)
+        warning('Coordinate mancanti per il ramo %g-%g; ramo ignorato nel plot.', f, t);
+        continue;
+    end
+
+    lat_linea = [lat(idx_f), lat(idx_t)];
+    lon_linea = [lon(idx_f), lon(idx_t)];
+
+    if ~valid_rate(i)
+        % Nessuna percentuale di caricamento se RATE_A è nullo/non definito.
+        h = geoplot(ax, lat_linea, lon_linea, ...
+            'Color', col_norate, 'LineStyle', '--', 'LineWidth', 1.5);
+        if isempty(hNoRate), hNoRate = h; end
+        continue;
+    end
+
+    carico_pct = loading_pct(i);
+
+    if carico_pct < 40
+        colore = col_low;
+        spessore = 1.3;
+        classe = 1;
+    elseif carico_pct < 75
+        colore = col_mid;
+        spessore = 1.8;
+        classe = 2;
+    elseif carico_pct <= 100
+        colore = col_high;
+        spessore = 2.5;
+        classe = 3;
+    else
+        colore = col_over;
+        spessore = 3.5;
+        classe = 4;
+    end
+
+    h = geoplot(ax, lat_linea, lon_linea, ...
+        'Color', colore, 'LineStyle', '-', 'LineWidth', spessore);
+
+    switch classe
+        case 1
+            if isempty(hLoadLow), hLoadLow = h; end
+        case 2
+            if isempty(hLoadMid), hLoadMid = h; end
+        case 3
+            if isempty(hLoadHigh), hLoadHigh = h; end
+        case 4
+            if isempty(hLoadOver), hLoadOver = h; end
+    end
+end
+
+%% 7. DISEGNO DEI NODI: COLORE = TENSIONE NODALE
+% il colore è assegnato soltanto alle tensioni calcolate sulle sbarre.
+hBus = geoscatter(ax, lat(~is_gen), lon(~is_gen), 72, V_mag(~is_gen), ...
+    'o', 'filled', 'MarkerEdgeColor', 'k', 'LineWidth', 0.9);
+
+hGen = geoscatter(ax, lat(is_gen), lon(is_gen), 88, V_mag(is_gen), ...
+    's', 'filled', 'MarkerEdgeColor', 'k', 'LineWidth', 1.1);
+
+% Simbolo nero sovrapposto al bus slack; il quadrato sottostante conserva
+% il colore associato alla tensione del nodo.
+hSlack = gobjects(0);
+if any(is_slack)
+    hSlack = geoscatter(ax, lat(is_slack), lon(is_slack), 125, 'k', ...
+        'p', 'filled', 'MarkerEdgeColor', 'w', 'LineWidth', 0.8);
+end
+
+% Cerchio esterno nero per evidenziare ogni bus fuori dai propri limiti VMIN/VMAX.
+hViol = gobjects(0);
+if any(violV)
+    hViol = geoscatter(ax, lat(violV), lon(violV), 155, 'k', 'o', ...
+        'MarkerFaceColor', 'none', 'LineWidth', 2.0);
+end
+
+%% 8. ETICHETTE DEI BUS
+for k = 1:numel(lat)
+    text(lat(k), lon(k), ['  ', etichette{k}], ...
+        'FontSize', 7.5, 'FontWeight', 'bold', ...
+        'Color', [0.10, 0.10, 0.10]);
+end
+
+%% 9. SCALA COLORI, LIMITI MAPPA, TITOLO E LEGENDA
+colormap(ax, parula(256));
+clim(ax, [0.94, 1.07]);
+cb = colorbar(ax, 'eastoutside');
+cb.Label.String = 'Modulo della tensione nodale (p.u.)';
+cb.Label.FontSize = 10;
+cb.FontSize = 9;
+
+geolimits(ax, [41.0, 44.2], [-74.2, -69.2]);
+
+title(ax, {
+    'Sistema IEEE 39-bus - Load Flow AC (MATPOWER)', ...
+    }, 'FontSize', 12, 'FontWeight', 'bold');
+
+% Legenda compatta: include soltanto le classi effettivamente presenti.
+legH = {};
+legT = {};
+if ~isempty(hLoadLow)
+    legH{end+1} = hLoadLow; %#ok<SAGROW>
+    legT{end+1} = 'Ramo: carico < 40%'; %#ok<SAGROW>
+end
+if ~isempty(hLoadMid)
+    legH{end+1} = hLoadMid; %#ok<SAGROW>
+    legT{end+1} = 'Ramo: 40-<75%'; %#ok<SAGROW>
+end
+if ~isempty(hLoadHigh)
+    legH{end+1} = hLoadHigh; %#ok<SAGROW>
+    legT{end+1} = 'Ramo: 75-100%'; %#ok<SAGROW>
+end
+if ~isempty(hLoadOver)
+    legH{end+1} = hLoadOver; %#ok<SAGROW>
+    legT{end+1} = 'Ramo: >100%'; %#ok<SAGROW>
+end
+if ~isempty(hNoRate)
+    legH{end+1} = hNoRate; %#ok<SAGROW>
+    legT{end+1} = 'RATE_A non specificato'; %#ok<SAGROW>
+end
+legH{end+1} = hBus;
+legT{end+1} = 'Bus senza generatore';
+legH{end+1} = hGen;
+legT{end+1} = 'Bus con generatore';
+if ~isempty(hSlack)
+    legH{end+1} = hSlack;
+    legT{end+1} = 'Bus slack';
+end
+if ~isempty(hViol)
+    legH{end+1} = hViol;
+    legT{end+1} = 'Tensione fuori limite';
+end
+
+legend(ax, [legH{:}], legT, 'Location', 'southoutside', ...
+    'NumColumns', 3, 'FontSize', 8);
+
+hold(ax, 'off');
+
+%% 10. DIAGNOSTICA NUMERICA: TENSIONI, GENERATORI E RAMI
+fprintf('\n====================================================\n');
+fprintf('DIAGNOSTICA LOAD FLOW AC - IEEE 39-BUS\n');
+fprintf('====================================================\n');
+fprintf('Load flow convergente: %d\n', success);
+fprintf('Bus: %d | Generatori: %d | Rami: %d (in servizio: %d)\n', ...
+    size(results.bus, 1), size(results.gen, 1), size(results.branch, 1), ...
+    sum(branch_status));
+fprintf('Tensione minima: %.4f p.u. al bus %g\n', min(V_mag), bus_num(V_mag == min(V_mag)));
+fprintf('Tensione massima: %.4f p.u. al bus %g\n', max(V_mag), bus_num(V_mag == max(V_mag)));
+
+% Violazioni di tensione rispetto ai limiti definiti per ciascun bus.
+fprintf('\n--- Bus fuori limite di tensione ---\n');
+if any(violV)
+    disp(table(bus_num(violV), V_mag(violV), Vmin(violV), Vmax(violV), ...
+        'VariableNames', {'Bus', 'Vm_pu', 'Vmin_pu', 'Vmax_pu'}));
+else
+    fprintf('Nessun bus fuori limite di tensione.\n');
+end
+
+% Verifica dei limiti P e Q dei generatori online.
+gen_bus = results.gen(:, 1);
+Pg = results.gen(:, 2);
+Qg = results.gen(:, 3);
+Qmax = results.gen(:, 4);
+Qmin = results.gen(:, 5);
+gen_status = results.gen(:, 8) > 0;
+Pmax = results.gen(:, 9);
+Pmin = results.gen(:, 10);
+
+violP = gen_status & ((Pg < Pmin - tol) | (Pg > Pmax + tol));
+violQ = gen_status & ((Qg < Qmin - tol) | (Qg > Qmax + tol));
+
+fprintf('\n--- Generatori fuori limite di potenza attiva ---\n');
+if any(violP)
+    disp(table(gen_bus(violP), Pg(violP), Pmin(violP), Pmax(violP), ...
+        'VariableNames', {'Bus', 'Pg_MW', 'Pmin_MW', 'Pmax_MW'}));
+else
+    fprintf('Nessun generatore online fuori limite P.\n');
+end
+
+fprintf('\n--- Generatori fuori limite di potenza reattiva ---\n');
+if any(violQ)
+    disp(table(gen_bus(violQ), Qg(violQ), Qmin(violQ), Qmax(violQ), ...
+        'VariableNames', {'Bus', 'Qg_MVAr', 'Qmin_MVAr', 'Qmax_MVAr'}));
+else
+    fprintf('Nessun generatore online fuori limite Q.\n');
+end
+
+% Rami oltre RATE_A e statistiche del caricamento.
+violBranch = valid_rate & (loading_pct > 100 + tol);
+fprintf('\n--- Rami oltre il 100%% di RATE_A ---\n');
+if any(violBranch)
+    disp(table(from_bus(violBranch), to_bus(violBranch), ...
+        loading_pct(violBranch), rate_A(violBranch), ...
+        'VariableNames', {'FromBus', 'ToBus', 'Carico_pct', 'RATE_A_MVA'}));
+else
+    fprintf('Nessun ramo supera il 100%% dei limiti RATE_A specificati.\n');
+end
+
+if any(valid_rate)
+    idxValid = find(valid_rate);
+    [maxLoading, idxLocal] = max(loading_pct(valid_rate));
+    idxMax = idxValid(idxLocal);
+    fprintf('Massimo caricamento tra i rami con RATE_A specificato: %.2f%% sul ramo %g-%g.\n', ...
+        maxLoading, from_bus(idxMax), to_bus(idxMax));
+else
+    fprintf('Non ci sono rami in servizio con RATE_A positivo.\n');
+end
+
+nNoRate = sum(branch_status & ~(rate_A > 0));
+fprintf('Rami in servizio senza RATE_A positivo: %d (visualizzati grigi tratteggiati).\n', nNoRate);
